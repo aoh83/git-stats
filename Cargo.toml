@@ -1,0 +1,17 @@
+[package]
+name = "git-contrib"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# for profiling
+[profile.release]
+debug = 1
+[build]
+rustflags = ["-C", "symbol-mangling-version=v0"]
+
+[dependencies]
+anyhow = "1.0.75"
+derive_more = "0.99.17"
+git2 = "0.18.1"
