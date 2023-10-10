@@ -1,14 +1,8 @@
 use anyhow::Result;
-use derive_more::{Display, Error};
-use git2::{Repository, Tree, ObjectType, Object, TreeWalkMode, TreeWalkResult};
+use git2::{Repository,  ObjectType, TreeWalkMode, TreeWalkResult};
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
-
-#[derive(Default, Debug, Display, Error)]
-struct GitError {
-    reason: String
-}
 
 fn make_blame(repo: &Repository, fname :&Path, authors: &mut HashMap<String, usize>) -> Result<()>{
         let fblame = repo.blame_file(&fname, None)?;
@@ -38,17 +32,13 @@ fn get_tree(repo: &Repository) -> Result<HashMap<String, usize>> {
     Ok(authors)
 }
 
-
 fn main() -> Result<()> {
-    // think of clap for parsing arguments.
-    // cargo add clap
+    // TODO: cargo add clap
     let args: Vec<String> = env::args().collect();
     assert!(args.len() == 2);
 
     let repo = Repository::open(&args[1])?;
     let authors = get_tree(&repo)?;
-    println!("test");
-    
     
     let mut vec : Vec<(&String, &usize)> = authors.iter().collect();
     vec.sort_by(|lhs, rhs| rhs.1.cmp(lhs.1));

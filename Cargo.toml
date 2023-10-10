@@ -13,5 +13,5 @@ rustflags = ["-C", "symbol-mangling-version=v0"]
 
 [dependencies]
 anyhow = "1.0.75"
-derive_more = "0.99.17"
+# derive_more = "0.99.17"
 git2 = "0.18.1"
