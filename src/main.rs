@@ -1,22 +1,33 @@
 use std::collections::HashMap;
-use std::{env, io};
+use std::error::Error;
+use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::thread::available_parallelism;
+use std::time::Duration;
 
-use anyhow::{Result,};
-use async_executor::Executor;
-use crossbeam_channel::{Receiver, unbounded};
-use easy_parallel::Parallel;
-use futures_lite::future;
+use anyhow::Result;
+use clap::Parser;
+use crossbeam_channel::bounded;
 use git2::{ObjectType, Repository, TreeWalkMode, TreeWalkResult};
+use serde::Serialize;
+use tokio::runtime::Runtime;
 
-type Blames = Vec<(String, usize)>;
-
-struct BlameChunk {
+#[derive(Debug, Serialize, Clone)]
+struct Blame {
     author: String,
-    lines: usize
+    lines: usize,
 }
 
+type Blames = Vec<Blame>;
+
+#[derive(Clone, Debug)]
+enum BlameMessage {
+    Blame(Blames),
+    Count(usize)
+}
+
+#[derive(Clone)]
 struct CancellationToken {
     sender: Arc<Mutex<bool>>,
 }
@@ -42,7 +53,7 @@ fn make_blame(repo: &Repository, fname: &Path) -> Result<Blames>
 }
 
 fn get_tree<F>(repo: &Repository, updater: &mut F) -> Result<usize>
-    where F: FnMut(&str)
+    where F: FnMut(&str) -> Result<()>
 {
     let head = repo.head()?.peel_to_tree()?;
     let mut cnt: usize = 0;
@@ -52,102 +63,163 @@ fn get_tree<F>(repo: &Repository, updater: &mut F) -> Result<usize>
         let mut result = path.to_owned();
         result.push_str(entry.name().expect("empty filename"));
         cnt = cnt + 1; // why does += 1 not work?
-        updater(&result);
-        TreeWalkResult::Ok
+        let result = updater(&result);
+        if result.is_err() { TreeWalkResult::Abort } else { TreeWalkResult::Ok }
     })?;
 
     Ok(cnt)
 }
 
-fn acc_impl(blame: Blames, hm: &mut HashMap<String, usize>) {
+fn blame_fold(mut hm: HashMap<String, usize>,  blame: Blames) -> HashMap<String, usize> {
     for blame_chunk in blame {
-        let entry = hm.entry(blame_chunk.0).or_insert(0);
-        *entry += blame_chunk.1;
+        let entry = hm.entry(blame_chunk.author).or_insert(0);
+        *entry += blame_chunk.lines;
     }
+    hm
 }
 
-fn acc(rx: &Receiver<Blames>, mut count: usize) -> Result<Blames> {
-    let mut agg = HashMap::<String, usize>::new();
-    while count > 0 {
-        acc_impl(rx.recv()?, &mut agg);
-        count -= 1;
+fn blame_f(hm: &mut HashMap<String, usize>,  blame: Blames)  {
+    for blame_chunk in blame {
+        let entry = hm.entry(blame_chunk.author).or_insert(0);
+        *entry += blame_chunk.lines;
     }
-    Ok(hm_into_vec(&agg))
 }
 
 fn hm_into_vec(authors: &HashMap<String, usize>) -> Blames {
     let mut blames: Blames = authors.iter()
-        .map(|(x,y)| { (x.to_owned(), y.to_owned())} )
+        .map(|(x, y)| { Blame {author: x.to_owned(), lines: y.to_owned()} })
         .collect();
-    blames.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1));
+    blames.sort_by(|lhs, rhs| rhs.lines.cmp(&lhs.lines));
     blames
 }
 
 fn single_threaded(path: &str) -> Result<Blames> {
     let repo = Repository::open(path)?;
     let mut files = Vec::new();
-    let mut result = HashMap::new();
     let _ = get_tree(&repo, &mut |path: &str| {
         files.push(path.to_owned());
+        Ok(())
     })?;
-    for f in files {
-        let blame = make_blame(&repo, Path::new(&f))?;
-        acc_impl(blame, &mut result);
-    }
+    let result = files.iter()
+        .map(|f| { make_blame(&repo, Path::new(&f)).expect("unblamable") })
+        .fold(HashMap::new(), &blame_fold);
     Ok(hm_into_vec(&result))
 }
 
-fn multi_threaded(path: &str) ->  Result<Vec<Blames>>{
-    anyhow::bail!("not implemented")
-    //
-    // let executor = Executor::new();
-    // let (to_pool, for_pool) = unbounded();
-    // let (to_acc, for_acc) = unbounded();
-    //
-    // let repo = Arc::new(Mutex::new(Repository::open(".")));
-    // let update = move |path: &str| {
-    //     to_pool.send(path.to_owned()).unwrap(); // FIXME: unwrap()
-    // };
-    //
-    // let ct = CancellationToken::new();
-    //
-    // let mut tasks = Vec::new();
-    //
-    // for _ in 0..4 {
-    //     let task = executor.spawn(
-    //         async {}
-    //     );
-    //     tasks.push(task);
-    // }
-    // let p = Parallel::new()
-    //     // Run four executor threads.
-    //     .each(0..4, |_| future::block_on(executor.run(
-    //         async {
-    //             while !ct.is_cancelled() {
-    //                 let m = for_pool.recv().unwrap();
-    //                 let res = make_blame(&repo.lock().unwrap(), Path::new(&m)).unwrap();
-    //                 to_acc.send(res).unwrap();
-    //                 ()
-    //             }
-    //         })));
-    // p.run();
-    //
-    // let cnt = get_tree(&repo.lock().unwrap(), update)?;
-    //
-    // let mut vec = acc(&for_acc, cnt)?;
-    // ct.cancel();
+async fn retry<F, E, V>(mut f: F, mut attempts: u8, interval: Duration) -> Result<V, E>
+    where
+        E: Error,
+        F: FnMut() -> Result<V, E>,
+{
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempts == 0 {
+                    return Err(e);
+                }
+                attempts -= 1;
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
+}
 
-    // let mut vec : Vec<(&String, &usize)> = authors.iter().collect();
+fn multi_threaded(path: &str, workers: usize) ->  Result<Blames> {
+    let rt = Runtime::new().unwrap();
+    let (to_pool, for_pool) = bounded(100);
+    let (to_acc, for_acc) = bounded(100);
+    let (to_print, for_print) = bounded(1);
+    let ct = CancellationToken::new();
+
+    {
+        let to_acc = to_acc.clone();
+        let to_pool = to_pool.clone();
+        let path = path.to_owned();
+        rt.spawn(async move {
+            let repo = Repository::open(path).unwrap();
+            let mut update = |path: &str| -> Result<()> {
+                // println!("trying to send {:?}", path);
+                to_pool.send(path.to_owned())?;
+                Ok(())
+            };
+            let cnt = get_tree(&repo, &mut update).unwrap();
+            to_acc.send(BlameMessage::Count(cnt)).unwrap();
+        });
+    }
+
+    for _ in 0..workers {
+        let for_pool = for_pool.clone();
+        let ct = ct.clone();
+        let path = path.to_owned();
+        let to_acc = to_acc.clone();
+        rt.spawn(async move {
+            let repo = Repository::open(path).unwrap();
+            while !ct.is_cancelled() {
+                let m = for_pool.recv().unwrap();
+                let res = make_blame(&repo, Path::new(&m)).unwrap();
+                let bm = BlameMessage::Blame(res);
+                let retry_result = retry(|| { to_acc.send(bm.clone()) }, 20, Duration::from_millis(1)).await;
+                if retry_result.is_err() {
+                    println!("closing worker, retries exceeded\n");
+                }
+
+            }
+        });
+    }
+
+    {
+        let for_acc = for_acc.clone();
+        let mut hm = HashMap::new();
+        let ct = ct.clone();
+        let to_print = to_print.clone();
+        rt.spawn(async move {
+            let mut count = 0;
+            let mut c = None;
+            while c.is_none() || count < c.unwrap() {
+                let msg = for_acc.recv().unwrap();
+                match msg {
+                    BlameMessage::Count(i) => c = Some(i),
+                    BlameMessage::Blame(b) => blame_f(&mut hm, b)
+                }
+                count += 1;
+            }
+            ct.cancel();
+            to_print.send(hm_into_vec(&hm)).unwrap();
+        });
+    }
+    rt.block_on(async {});
+
+    Ok(for_print.recv().unwrap())
+}
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    single: bool,
+
+    #[arg(short, long, default_value_t = 0)]
+    workers: usize,
+
+    #[arg(short, long, default_value = ".")]
+    path: String,
 }
 
 fn main() -> Result<()> {
-    // TODO: cargo add clap
-    // --single
-    // --parallel
-    // --path
-    // --top n
+    let mut args = Args::parse();
 
-    let blames = single_threaded(".")?;
+    if args.workers == 0 {
+        args.workers = available_parallelism().unwrap().get();
+    }
+    println!("using {} workers", args.workers);
+
+
+    let blames = if args.single {
+        single_threaded(&args.path)?
+    } else {
+        multi_threaded(&args.path, args.workers)?
+    };
     let mut wtr = csv::Writer::from_writer(io::stdout());
     for b in blames {
         wtr.serialize(b)?;
